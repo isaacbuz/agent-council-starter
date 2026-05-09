@@ -1,0 +1,40 @@
+slug: example-app
+name: Example App
+boundary: internal
+repo: .
+status: active
+verification:
+  last_verified_at: '2026-05-09T22:37:44+00:00'
+  verified_by: codex
+  confidence: fresh
+state:
+  current_state: .council/current-state/example-app.yaml
+  git_branch: main
+  git_head: null
+  open_prs: []
+  open_issues_count: 0
+active_agents:
+- agent: codex
+  harness: openai-desktop
+  focus: Cross-IDE smoke test
+  since: '2026-05-09T22:37:44+00:00'
+  ended: '2026-05-09T22:37:44+00:00'
+  last_summary: Cross-IDE smoke test complete
+alerts:
+- id: example-alert
+  severity: info
+  status: active
+  owner: team
+  found_by: bootstrap
+  found_at: '2026-01-01T00:00:00Z'
+  last_checked_at: '2026-01-01T00:00:00Z'
+  next_check: '2099-01-01T00:00:00Z'
+  message: Replace this sample alert with real project risks.
+  action: Edit .council/projects/example-app.yaml.
+key_facts:
+- This is sanitized sample data.
+- Use session.sh start/end for every non-trivial agent session.
+prs_waiting_review: []
+next_best_action: Customize this project card for your first real repository.
+last_updated: '2026-05-09T22:37:44+00:00'
+last_updated_by: codex

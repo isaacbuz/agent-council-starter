@@ -1,0 +1,26 @@
+version: 1
+updated: "2026-01-01T00:00:00Z"
+updated_by: bootstrap
+
+agents:
+  - id: codex
+    card: agents/codex.yaml
+    active: false
+  - id: claude
+    card: agents/claude.yaml
+    active: false
+  - id: gemini
+    card: agents/gemini.yaml
+    active: false
+
+projects:
+  - slug: example-app
+    card: projects/example-app.yaml
+    boundary: internal
+    active_agents: []
+
+ledger: ledger.jsonl
+query_tool: query.sh
+doctor_tool: doctor.sh
+session_tool: session.sh
+current_state_dir: current-state/

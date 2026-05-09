@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.venv/
+node_modules/
+.council/ledger.jsonl
+.council/current-state/*.yaml
+.council/current-state/*.tmp
+.council/steward/reports/*.md
+.council/steward/reports/*.json
+!.council/steward/reports/.gitkeep

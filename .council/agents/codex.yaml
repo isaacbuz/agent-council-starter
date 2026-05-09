@@ -1,0 +1,11 @@
+id: codex
+name: Codex
+harness: openai-desktop
+provider: openai
+capabilities:
+  can_run_commands: true
+  can_edit_files: true
+last_active: '2026-05-09T22:37:44+00:00'
+last_project: example-app
+last_session_summary: Cross-IDE smoke test complete
+last_session_ended: '2026-05-09T22:37:44+00:00'

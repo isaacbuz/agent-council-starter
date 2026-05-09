@@ -1,0 +1,10 @@
+id: gemini
+name: Gemini
+harness: ide-or-cli
+provider: google
+capabilities:
+  can_run_commands: true
+  can_edit_files: true
+last_active: null
+last_project: null
+last_session_summary: null
