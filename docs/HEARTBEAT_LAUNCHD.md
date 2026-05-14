@@ -5,12 +5,23 @@ usually better.
 
 The heartbeat should:
 
-- run on login and every 10-15 minutes while the Mac is awake
-- run `doctor.sh`
+- run on login and every 15-30 minutes while the Mac is awake
+- run `warden.sh` — the dumb janitor: sweep expired leases, prune long-ended
+  agents from project cards, refresh manifest `active` flags, run `doctor.sh`
 - regenerate current-state files
+- run `rotate-ledger.sh` (a cheap no-op until the month rolls over)
 - optionally render a session tree for diagnostics
 - optionally run `steward.sh --no-model` or a local-model Steward report
-- avoid mutating repos, issues, PRs, or external systems
+
+### Warden vs Steward — both are safe to schedule
+
+- **`warden.sh`** makes *deterministic* edits to council state only (sweeps
+  leases, prunes ended agents, flips `active` flags). It never touches repos,
+  issues, PRs, or external systems, and uses no model — pure mechanical chores.
+  This is what keeps the council from rotting between sessions.
+- **`steward.sh`** is read-mostly: it summarizes, it does not mutate.
+
+Neither mutates anything outside `.council/`.
 
 ## Example Heartbeat Script
 
@@ -27,7 +38,8 @@ for project in .council/projects/*.yaml; do
   ./bin/current-state.sh "$slug" >/dev/null || true
 done
 
-./bin/doctor.sh || true
+./bin/warden.sh || true          # sweep leases, prune stale cards, refresh flags, doctor
+./bin/rotate-ledger.sh || true   # no-op until the month rolls over
 ./bin/steward.sh --no-model || true
 ```
 

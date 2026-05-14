@@ -29,10 +29,15 @@ writes, leases auto-expire so a crashed agent never blocks a lane, and
 3. Add `docs/AGENT_INSTRUCTIONS_SNIPPET.md` to the repo's agent instructions.
 4. Ask every agent session to use `session.sh start/end` and `traffic.sh
    acquire/release` around its work.
-5. Run `doctor.sh` at the start of standup or handoff.
-6. Run `steward.sh --no-model` once per day for stale-session summaries.
-7. After one week, review whether skipped closeouts, stale cards, or
-   same-worktree collisions decreased.
+5. Run `./bin/install-hooks.sh` in the repo so an unclaimed push prints an
+   advisory warning.
+6. Schedule `warden.sh` every 15-30 min (see `docs/HEARTBEAT_LAUNCHD.md`) so
+   stale leases and ended sessions get swept automatically.
+7. Run `doctor.sh` at the start of standup or handoff.
+8. Run `steward.sh --no-model` once per day for stale-session summaries.
+9. After one week, run `./bin/query.sh stats` and review the numbers:
+   closeout rate, RED-hit rate, collisions, avg lease hold. The pilot succeeds
+   if closeout rate climbs and same-worktree collisions trend toward zero.
 
 ## What To Avoid
 

@@ -42,6 +42,14 @@ for line in sys.stdin:
     shift
     exec "${PYTHON:-python3}" "$SCRIPT_DIR/council.py" tree "$@"
     ;;
+  board)
+    shift
+    exec "${PYTHON:-python3}" "$SCRIPT_DIR/council.py" claim board "$@"
+    ;;
+  stats)
+    shift
+    exec "${PYTHON:-python3}" "$SCRIPT_DIR/council.py" stats "$@"
+    ;;
   *)
     echo "Usage:"
     echo "  query.sh tail [N]"
@@ -49,5 +57,7 @@ for line in sys.stdin:
     echo "  query.sh doctor [project]"
     echo "  query.sh current [project]"
     echo "  query.sh tree [project]"
+    echo "  query.sh board               # traffic-control leases + collisions"
+    echo "  query.sh stats               # coordination + traffic metrics"
     ;;
 esac

@@ -148,13 +148,19 @@ agent-council-starter/
 │   ├── current-state.sh
 │   ├── query.sh
 │   ├── steward.sh
+│   ├── warden.sh
+│   ├── rotate-ledger.sh
+│   ├── install-hooks.sh
 │   └── dogfood-smoke.sh
+├── hooks/
+│   └── pre-push
 ├── .council/
 │   ├── manifest.yaml
 │   ├── ledger.example.jsonl
 │   ├── agents/
 │   ├── projects/
 │   ├── claims/
+│   ├── ledger-archive/
 │   └── current-state/
 ├── docs/
 │   ├── AGENT_INSTRUCTIONS_SNIPPET.md
@@ -167,6 +173,26 @@ agent-council-starter/
 └── examples/
     └── AGENTS.md
 ```
+
+## Maintenance
+
+The council is passive infrastructure — a few mechanical chores keep it honest.
+None of them use a model or touch anything outside `.council/`.
+
+```bash
+./bin/warden.sh          # sweep expired leases, prune long-ended agents from
+                         # project cards, refresh manifest active flags, run doctor
+./bin/rotate-ledger.sh   # archive ledger events before the current month into
+                         # .council/ledger-archive/ledger-YYYY-MM.jsonl
+./bin/query.sh stats     # coordination + traffic metrics: closeout rate,
+                         # RED-hit rate, avg lease hold, activity by agent
+./bin/install-hooks.sh   # install the advisory pre-push hook into a repo —
+                         # warns when you push from an unclaimed worktree
+```
+
+Schedule `warden.sh` every 15-30 min (see `docs/HEARTBEAT_LAUNCHD.md`) so the
+council never rots between sessions. `rotate-ledger.sh` is a cheap no-op until
+the month rolls over, so it is safe to run on the same schedule.
 
 ## Cross-IDE And Cross-Project Use
 

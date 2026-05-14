@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 node_modules/
 .council/ledger.jsonl
+.council/ledger-archive/*.jsonl
 .council/current-state/*.yaml
 .council/current-state/*.tmp
 .council/steward/reports/*.md

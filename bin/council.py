@@ -30,6 +30,7 @@ except ImportError as exc:
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 COUNCIL_HOME = pathlib.Path(os.environ.get("COUNCIL_HOME", REPO_ROOT / ".council")).expanduser().resolve()
 LEDGER = COUNCIL_HOME / "ledger.jsonl"
+LEDGER_ARCHIVE_DIR = COUNCIL_HOME / "ledger-archive"
 PROJECT_DIR = COUNCIL_HOME / "projects"
 AGENT_DIR = COUNCIL_HOME / "agents"
 CURRENT_DIR = COUNCIL_HOME / "current-state"
@@ -40,6 +41,8 @@ STALE_VERIFY_HOURS = int(os.environ.get("COUNCIL_STALE_VERIFY_HOURS", "24"))
 STALE_SESSION_HOURS = int(os.environ.get("COUNCIL_STALE_SESSION_HOURS", "12"))
 TREE_RENDER_DEPTH = int(os.environ.get("COUNCIL_TREE_RENDER_DEPTH", "8"))
 DEFAULT_CLAIM_TTL = int(os.environ.get("COUNCIL_CLAIM_TTL", "1800"))  # lease goes stale 30 min after last heartbeat
+ACTIVE_AGENT_RETAIN_HOURS = int(os.environ.get("COUNCIL_ACTIVE_RETAIN_HOURS", "24"))  # drop ended active_agents older than this
+AGENT_ACTIVE_WINDOW_HOURS = int(os.environ.get("COUNCIL_AGENT_ACTIVE_WINDOW_HOURS", "12"))  # ledger recency -> manifest active flag
 
 
 def now_utc() -> dt.datetime:
@@ -938,6 +941,183 @@ def claim(args: argparse.Namespace) -> int:
     return dispatch[args.claim_action](args)
 
 
+# ── Ledger rotation ─────────────────────────────────────────────────────────
+#
+# ledger.jsonl is append-only and grows forever. `rotate-ledger` moves every
+# event from before the current month into ledger-archive/ledger-YYYY-MM.jsonl
+# and leaves the live ledger holding only the current month. Query tools read
+# the live ledger by default; archives are there for history, not hot reads.
+
+
+def rotate_ledger() -> int:
+    if not LEDGER.exists():
+        print("no ledger to rotate")
+        return 0
+    cutoff = now_utc().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    keep: list[str] = []
+    archive: dict[str, list[str]] = {}
+    for line in LEDGER.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            keep.append(line)  # never drop unparseable lines
+            continue
+        ts = parse_time(event.get("ts"))
+        if ts and ts < cutoff:
+            archive.setdefault(ts.strftime("%Y-%m"), []).append(line)
+        else:
+            keep.append(line)
+    if not archive:
+        print("nothing to rotate — all events are from the current month")
+        return 0
+    LEDGER_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    for month, lines in sorted(archive.items()):
+        with (LEDGER_ARCHIVE_DIR / f"ledger-{month}.jsonl").open("a") as fh:
+            fh.write("\n".join(lines) + "\n")
+    LEDGER.write_text(("\n".join(keep) + "\n") if keep else "")
+    moved = sum(len(v) for v in archive.values())
+    print(f"rotated {moved} event(s) into {len(archive)} archive file(s); {len(keep)} remain in the live ledger")
+    return 0
+
+
+# ── Stats — make the pilot measurable ───────────────────────────────────────
+
+
+def stats() -> int:
+    events = ledger_events()
+    if not events:
+        print("no events in the ledger")
+        return 0
+    times = [t for t in (parse_time(e.get("ts")) for e in events) if t]
+    span_days = max((max(times) - min(times)).total_seconds() / 86400, 1e-9) if times else 0
+    by_event: dict[str, int] = {}
+    by_agent: dict[str, int] = {}
+    for event in events:
+        by_event[str(event.get("event", "?"))] = by_event.get(str(event.get("event", "?")), 0) + 1
+        by_agent[normalize_agent(str(event.get("agent", "?")))] = (
+            by_agent.get(normalize_agent(str(event.get("agent", "?"))), 0) + 1
+        )
+    starts = by_event.get("session_start", 0)
+    ends = by_event.get("session_end", 0)
+    acquired = by_event.get("claim_acquired", 0)
+    denied = by_event.get("claim_denied", 0)
+    expired = by_event.get("claim_expired", 0)
+    stolen = by_event.get("claim_stolen", 0)
+    closeout = (ends / starts * 100) if starts else 0.0
+    red_rate = (denied / (acquired + denied) * 100) if (acquired + denied) else 0.0
+    # Average lease hold: pair claim_acquired -> claim_released by (agent, resource).
+    holds: list[float] = []
+    open_claims: dict[tuple[str, str], dt.datetime] = {}
+    for event in events:
+        kind = event.get("event")
+        if kind not in {"claim_acquired", "claim_released"}:
+            continue
+        ts = parse_time(event.get("ts"))
+        summary = str(event.get("summary", ""))
+        # resource is the path token in the summary; key on agent+summary-tail is too loose,
+        # so key on agent + the resource substring after "on ".
+        resource = summary.split(" on ", 1)[1].split(":")[0].strip() if " on " in summary else summary
+        key = (normalize_agent(str(event.get("agent", ""))), resource)
+        if kind == "claim_acquired" and ts:
+            open_claims[key] = ts
+        elif kind == "claim_released" and ts and key in open_claims:
+            holds.append((ts - open_claims.pop(key)).total_seconds() / 60)
+    avg_hold = sum(holds) / len(holds) if holds else 0.0
+
+    print("=== Agent Council Stats ===")
+    print(f"window: {times[0].isoformat() if times else '?'} -> {times[-1].isoformat() if times else '?'}  ({span_days:.1f} days)")
+    print(f"total events: {len(events)}")
+    print()
+    print("Coordination health")
+    print(f"  sessions started / ended : {starts} / {ends}")
+    print(f"  closeout rate            : {closeout:.0f}%   (sessions that logged a clean end)")
+    print(f"  open (unclosed) sessions : {max(starts - ends, 0)}")
+    print()
+    print("Traffic control")
+    print(f"  leases acquired          : {acquired}")
+    print(f"  RED hits (claim_denied)  : {denied}   ({denied / span_days:.1f}/day)")
+    print(f"  RED-hit rate             : {red_rate:.0f}%   (denied / all acquire attempts)")
+    print(f"  stale leases swept       : {expired}")
+    print(f"  stale leases reclaimed   : {stolen}")
+    print(f"  avg lease hold           : {avg_hold:.0f} min  (over {len(holds)} matched acquire/release pairs)")
+    print()
+    print("Activity by agent")
+    for agent, count in sorted(by_agent.items(), key=lambda kv: -kv[1]):
+        print(f"  {agent:20s} {count}")
+    return 0
+
+
+# ── Warden — the dumb janitor (no LLM, safe to cron) ────────────────────────
+#
+# The council is passive infrastructure. The warden is the mechanical chore
+# loop that keeps it honest: sweep expired leases, prune long-ended agents from
+# project cards, recompute manifest `active` flags from ledger recency, then run
+# doctor. It makes deterministic edits only — no judgement, safe to schedule.
+
+
+def warden() -> int:
+    print("=== Agent Council Warden ===")
+    print(f"ran_at: {iso_now()}")
+    actions: list[str] = []
+
+    swept = sweep_claims()
+    actions.append(f"swept {len(swept)} stale lease(s)")
+
+    # Prune active_agents entries that ended more than ACTIVE_AGENT_RETAIN_HOURS ago.
+    pruned = 0
+    for path in PROJECT_DIR.glob("*.yaml"):
+        doc = load_yaml(path)
+        if not doc or doc.get("alias_for"):
+            continue
+        active = doc.get("active_agents")
+        if not isinstance(active, list) or not active:
+            continue
+        kept = []
+        for item in active:
+            ended = parse_time(item.get("ended")) if isinstance(item, dict) else None
+            if ended and now_utc() - ended > dt.timedelta(hours=ACTIVE_AGENT_RETAIN_HOURS):
+                pruned += 1
+                continue
+            kept.append(item)
+        if len(kept) != len(active):
+            doc["active_agents"] = kept
+            write_yaml(path, doc)
+    actions.append(f"pruned {pruned} long-ended agent entr(ies) from project cards")
+
+    # Recompute manifest `active` flags from ledger recency.
+    manifest = load_yaml(MANIFEST)
+    if manifest.get("agents"):
+        recent: dict[str, dt.datetime] = {}
+        for event in ledger_events():
+            agent = normalize_agent(str(event.get("agent", "")))
+            ts = parse_time(event.get("ts"))
+            if agent and ts and (agent not in recent or ts > recent[agent]):
+                recent[agent] = ts
+        flipped = 0
+        window = dt.timedelta(hours=AGENT_ACTIVE_WINDOW_HOURS)
+        for entry in manifest["agents"]:
+            if not isinstance(entry, dict):
+                continue
+            agent = normalize_agent(str(entry.get("id", "")))
+            last = recent.get(agent)
+            is_active = bool(last and now_utc() - last < window)
+            if entry.get("active") != is_active:
+                entry["active"] = is_active
+                flipped += 1
+        if flipped:
+            manifest["updated"] = iso_now()
+            manifest["updated_by"] = "warden"
+            write_yaml(MANIFEST, manifest)
+        actions.append(f"refreshed {flipped} manifest active flag(s) from ledger recency")
+
+    for action in actions:
+        print(f"  - {action}")
+    print()
+    return doctor()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Portable Agent Council")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -975,7 +1155,16 @@ def main() -> int:
     claim_parser.add_argument("--project")
     claim_parser.add_argument("--ttl", type=int)
     claim_parser.add_argument("--force", action="store_true")
+    sub.add_parser("rotate-ledger", help="archive ledger events before the current month")
+    sub.add_parser("stats", help="coordination + traffic-control metrics over the ledger")
+    sub.add_parser("warden", help="janitor pass: sweep leases, prune stale cards, refresh flags, doctor")
     args = parser.parse_args()
+    if args.command == "rotate-ledger":
+        return rotate_ledger()
+    if args.command == "stats":
+        return stats()
+    if args.command == "warden":
+        return warden()
     if args.command == "claim":
         if args.claim_action in {"acquire", "heartbeat", "release"} and not args.agent:
             raise SystemExit(f"claim {args.claim_action} requires --agent")

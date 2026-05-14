@@ -1,0 +1,70 @@
+#!/bin/bash
+# Agent Council — pre-push hook (advisory).
+#
+# Warns when you push from a worktree that has NO active traffic-control claim.
+# It is a nudge, not a gate: it never blocks a push by default. Set
+# COUNCIL_PREPUSH_BLOCK=1 in the environment to make an unclaimed push fail.
+#
+# Install into a repo with:  /path/to/agent-council-starter/bin/install-hooks.sh
+#
+# COUNCIL_HOME resolution: $COUNCIL_HOME, else <repo>/.council. If neither
+# exists the hook exits silently — it never breaks pushes for repos that do not
+# use the council.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -z "$REPO_ROOT" ] && exit 0
+
+COUNCIL_HOME="${COUNCIL_HOME:-$REPO_ROOT/.council}"
+CLAIMS_DIR="$COUNCIL_HOME/claims"
+[ -d "$CLAIMS_DIR" ] || exit 0
+
+WORKTREE="$(cd "$REPO_ROOT" && pwd)"
+
+# Is there a live lease whose resource is this worktree (or a parent of it)?
+HAS_CLAIM="$(
+  WORKTREE="$WORKTREE" CLAIMS_DIR="$CLAIMS_DIR" python3 - <<'PY' 2>/dev/null || echo "error"
+import datetime, os, pathlib
+try:
+    import yaml
+except ImportError:
+    print("error"); raise SystemExit
+now = datetime.datetime.now(datetime.UTC)
+wt = os.environ["WORKTREE"]
+claims = pathlib.Path(os.environ["CLAIMS_DIR"])
+for path in claims.glob("*.yaml"):
+    try:
+        lease = yaml.safe_load(path.read_text()) or {}
+    except Exception:
+        continue
+    exp = lease.get("expires_at")
+    try:
+        expires = datetime.datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+    except Exception:
+        continue
+    if expires <= now:
+        continue
+    res = str(lease.get("resource", ""))
+    if wt == res or wt.startswith(res + "/"):
+        print(f"yes:{lease.get('agent','?')}")
+        break
+else:
+    print("no")
+PY
+)"
+
+case "$HAS_CLAIM" in
+  yes:*)
+    exit 0 ;;  # coordinated — silent
+  error)
+    exit 0 ;;  # PyYAML missing or parse error — never block on tooling gaps
+  *)
+    echo "council: pushing from a worktree with NO active traffic claim ($WORKTREE)" >&2
+    echo "council: another agent could be working here uncoordinated." >&2
+    echo "council: claim it next time -> traffic.sh acquire --agent <id> --harness <h> --resource \"\$(pwd)\"" >&2
+    if [ "${COUNCIL_PREPUSH_BLOCK:-0}" = "1" ]; then
+      echo "council: COUNCIL_PREPUSH_BLOCK=1 set — blocking this push." >&2
+      exit 1
+    fi
+    exit 0 ;;
+esac
