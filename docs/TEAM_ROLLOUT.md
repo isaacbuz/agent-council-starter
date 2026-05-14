@@ -8,6 +8,7 @@ agents across multiple IDEs.
 It answers:
 
 - Who is working right now?
+- **Can I safely edit this worktree, or is another agent already in it?**
 - What did the last agent change?
 - Which branch/head was the repo on?
 - What issues or PRs were touched?
@@ -15,15 +16,23 @@ It answers:
 - What should the next agent do first?
 - Which sub-agents were spawned, what they owned, and whether they closed out?
 
+The hardest of these in practice is the second one: two agents editing the same
+working directory clobber each other. **Traffic control** solves it — `traffic.sh
+acquire` gives each agent a red/yellow/green light on a worktree before it
+writes, leases auto-expire so a crashed agent never blocks a lane, and
+`doctor.sh` flags collisions. See the README "Traffic Control" section.
+
 ## Pilot Plan
 
 1. Choose one low-risk internal repository.
 2. Add `.council/projects/<project>.yaml`.
 3. Add `docs/AGENT_INSTRUCTIONS_SNIPPET.md` to the repo's agent instructions.
-4. Ask every agent session to use `session.sh start/end`.
+4. Ask every agent session to use `session.sh start/end` and `traffic.sh
+   acquire/release` around its work.
 5. Run `doctor.sh` at the start of standup or handoff.
 6. Run `steward.sh --no-model` once per day for stale-session summaries.
-7. After one week, review whether skipped closeouts or stale cards decreased.
+7. After one week, review whether skipped closeouts, stale cards, or
+   same-worktree collisions decreased.
 
 ## What To Avoid
 

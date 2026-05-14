@@ -23,6 +23,24 @@ Before non-trivial work, run:
   --summary "BRIEF PLAN"
 ```
 
+Then claim the worktree BEFORE you write in it (traffic light):
+
+```bash
+./bin/traffic.sh acquire \
+  --agent AGENT_ID --harness HARNESS \
+  --resource "$(pwd)" --intent "BRIEF PLAN"
+#   GREEN -> you own this worktree, proceed
+#   RED   -> another live agent holds it; DO NOT WRITE HERE.
+#            Use your own `git worktree add <dir> <branch>` and claim that path.
+```
+
+While working, extend the lease every ~15-20 min (it auto-expires 30 min after
+the last heartbeat):
+
+```bash
+./bin/traffic.sh heartbeat --agent AGENT_ID --resource "$(pwd)"
+```
+
 At closeout, run:
 
 ```bash
@@ -36,9 +54,13 @@ At closeout, run:
   --prs "789" \
   --blockers "ANYTHING STILL BLOCKED" \
   --next "NEXT BEST ACTION"
+
+./bin/traffic.sh release --agent AGENT_ID --resource "$(pwd)"
 ```
 
-Use `./bin/doctor.sh PROJECT_SLUG` when the project card may be stale.
+Use `./bin/doctor.sh PROJECT_SLUG` when the project card may be stale — it also
+flags stale leases, lease collisions, and open sessions with no claim.
+Use `./bin/traffic.sh board` to see who holds which worktree right now.
 Trust `./.council/current-state/PROJECT_SLUG.yaml` before older handoffs.
 ```
 

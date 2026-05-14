@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -32,11 +33,13 @@ LEDGER = COUNCIL_HOME / "ledger.jsonl"
 PROJECT_DIR = COUNCIL_HOME / "projects"
 AGENT_DIR = COUNCIL_HOME / "agents"
 CURRENT_DIR = COUNCIL_HOME / "current-state"
+CLAIMS_DIR = COUNCIL_HOME / "claims"
 MANIFEST = COUNCIL_HOME / "manifest.yaml"
 
 STALE_VERIFY_HOURS = int(os.environ.get("COUNCIL_STALE_VERIFY_HOURS", "24"))
 STALE_SESSION_HOURS = int(os.environ.get("COUNCIL_STALE_SESSION_HOURS", "12"))
 TREE_RENDER_DEPTH = int(os.environ.get("COUNCIL_TREE_RENDER_DEPTH", "8"))
+DEFAULT_CLAIM_TTL = int(os.environ.get("COUNCIL_CLAIM_TTL", "1800"))  # lease goes stale 30 min after last heartbeat
 
 
 def now_utc() -> dt.datetime:
@@ -395,6 +398,44 @@ def doctor(project: str | None = None) -> int:
             started = parse_time(event.get("ts"))
             if started and now_utc() - started > dt.timedelta(hours=STALE_SESSION_HOURS):
                 warnings.append(f"{slug}: open session stale >{STALE_SESSION_HOURS}h: {agent} ({session_id})")
+    # Traffic control: stale leases, collisions, sessions with no claim.
+    live_leases: list[dict[str, Any]] = []
+    for lease in all_claims():
+        if claim_is_live(lease):
+            live_leases.append(lease)
+        else:
+            infos.append(
+                f"claims: stale lease on {lease.get('resource')} "
+                f"(held by {lease.get('agent')}) — run `traffic.sh sweep`"
+            )
+    for i, lease_a in enumerate(live_leases):
+        for lease_b in live_leases[i + 1:]:
+            ra, rb = str(lease_a.get("resource")), str(lease_b.get("resource"))
+            if lease_a.get("agent") == lease_b.get("agent"):
+                continue
+            if ra == rb or ra.startswith(rb + "/") or rb.startswith(ra + "/"):
+                errors.append(
+                    f"claims: COLLISION — {lease_a.get('agent')} and {lease_b.get('agent')} "
+                    f"hold overlapping resources ({ra} / {rb})"
+                )
+    claimed = {(normalize_agent(d.get("agent", "")), str(d.get("resource"))) for d in live_leases}
+    for event in active.values():
+        session_project = canonical_project(str(event.get("project", "")))
+        if project and session_project != canonical_project(project):
+            continue
+        agent = normalize_agent(str(event.get("agent", "")))
+        cwd = expand_path(event.get("cwd") or event.get("repo"), REPO_ROOT)
+        if not cwd:
+            continue
+        if not any(
+            ag == agent and (str(cwd) == res or str(cwd).startswith(res + "/") or res.startswith(str(cwd) + "/"))
+            for ag, res in claimed
+        ):
+            warnings.append(
+                f"{session_project}: {agent} has an open session at {cwd} with no traffic claim "
+                f"— run `traffic.sh acquire`"
+            )
+
     print("Agent Council Doctor")
     print(f"home: {COUNCIL_HOME}")
     print(f"checked_at: {iso_now()}")
@@ -611,6 +652,292 @@ def print_tree(project: str | None = None) -> int:
     return 0
 
 
+# ── Traffic control: resource claims / leases ───────────────────────────────
+#
+# `session` records *that* an agent is working. It does not stop two agents
+# from editing the same working directory at once. A "claim" is a short-lived
+# lease on a resource (almost always a worktree path) that does: agents
+# `acquire` before writing, `heartbeat` while working, and `release` when done.
+# Leases auto-expire DEFAULT_CLAIM_TTL seconds after their last heartbeat, so a
+# crashed agent never blocks a lane forever. No daemon — pure files, like the
+# rest of the council.
+
+
+def resolve_resource(resource: str) -> tuple[str, str]:
+    """Return (canonical resource id, kind). Filesystem paths are resolved;
+    anything else is treated as an opaque named resource."""
+    text = str(resource or "").strip()
+    if not text:
+        raise SystemExit("--resource is required")
+    if text.startswith(("~", "/", ".")) or "/" in text:
+        path = expand_path(text, REPO_ROOT)
+        if path is None:
+            raise SystemExit(f"could not resolve resource path: {resource}")
+        kind = "worktree" if (path / ".git").exists() else "path"
+        return str(path), kind
+    return text, "named"
+
+
+def claim_path(resource_id: str) -> pathlib.Path:
+    digest = hashlib.sha1(resource_id.encode()).hexdigest()[:10]
+    base = pathlib.Path(resource_id).name or "resource"
+    safe = "".join(c if c.isalnum() or c in "-._" else "-" for c in base)[:48]
+    return CLAIMS_DIR / f"{safe}__{digest}.yaml"
+
+
+def claim_is_live(lease: dict[str, Any]) -> bool:
+    expires = parse_time(lease.get("expires_at"))
+    return bool(expires and expires > now_utc())
+
+
+def sweep_claims() -> list[dict[str, Any]]:
+    """Delete expired lease files. Returns the leases that were swept."""
+    swept: list[dict[str, Any]] = []
+    if not CLAIMS_DIR.exists():
+        return swept
+    for path in sorted(CLAIMS_DIR.glob("*.yaml")):
+        lease = load_yaml(path)
+        if not lease:
+            path.unlink(missing_ok=True)
+            continue
+        if not claim_is_live(lease):
+            swept.append(lease)
+            path.unlink(missing_ok=True)
+            append_ledger({
+                "ts": iso_now(),
+                "agent": "council",
+                "harness": "council",
+                "project": lease.get("project", ""),
+                "event": "claim_expired",
+                "summary": (
+                    f"swept stale lease on {lease.get('resource')} "
+                    f"(held by {lease.get('agent')}, last heartbeat {lease.get('heartbeat_at')})"
+                ),
+            })
+    return swept
+
+
+def all_claims() -> list[dict[str, Any]]:
+    if not CLAIMS_DIR.exists():
+        return []
+    return [lease for lease in (load_yaml(p) for p in sorted(CLAIMS_DIR.glob("*.yaml"))) if lease]
+
+
+def _new_lease(args: argparse.Namespace, resource_id: str, kind: str) -> dict[str, Any]:
+    ttl = int(getattr(args, "ttl", None) or DEFAULT_CLAIM_TTL)
+    project = ""
+    if getattr(args, "project", None):
+        project = canonical_project(args.project)
+    elif kind in {"worktree", "path"}:
+        project = infer_project(pathlib.Path(resource_id)) or ""
+    return {
+        "resource": resource_id,
+        "resource_kind": kind,
+        "agent": normalize_agent(args.agent),
+        "harness": args.harness,
+        "project": project,
+        "intent": getattr(args, "intent", "") or "",
+        "acquired_at": iso_now(),
+        "heartbeat_at": iso_now(),
+        "expires_at": (now_utc() + dt.timedelta(seconds=ttl)).replace(microsecond=0).isoformat(),
+        "ttl_seconds": ttl,
+        "host_pid": os.getpid(),
+    }
+
+
+def _bump_lease(lease: dict[str, Any]) -> None:
+    ttl = int(lease.get("ttl_seconds") or DEFAULT_CLAIM_TTL)
+    lease["heartbeat_at"] = iso_now()
+    lease["expires_at"] = (now_utc() + dt.timedelta(seconds=ttl)).replace(microsecond=0).isoformat()
+
+
+def claim_acquire(args: argparse.Namespace) -> int:
+    CLAIMS_DIR.mkdir(parents=True, exist_ok=True)
+    sweep_claims()
+    resource_id, kind = resolve_resource(args.resource)
+    lease_file = claim_path(resource_id)
+    me = normalize_agent(args.agent)
+    new_lease = _new_lease(args, resource_id, kind)
+    try:
+        # O_EXCL create — atomic. Whoever wins the race owns the lane.
+        os.close(os.open(lease_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+    except FileExistsError:
+        existing = load_yaml(lease_file)
+        if existing and normalize_agent(existing.get("agent", "")) == me:
+            _bump_lease(existing)
+            if getattr(args, "intent", ""):
+                existing["intent"] = args.intent
+            write_yaml(lease_file, existing)
+            print(f"GREEN — lease already yours; heartbeat refreshed: {resource_id}")
+            return 0
+        if existing and claim_is_live(existing):
+            print(
+                f"RED — {resource_id}\n"
+                f"   held by {existing.get('agent')} ({existing.get('harness')}) "
+                f"since {existing.get('acquired_at')}\n"
+                f"   intent: {existing.get('intent') or '(none stated)'}\n"
+                f"   expires: {existing.get('expires_at')} "
+                f"(last heartbeat {existing.get('heartbeat_at')})\n"
+                f"   -> do NOT write here. Use a separate worktree, pick another task, "
+                f"or coordinate via the ledger."
+            )
+            append_ledger({
+                "ts": iso_now(), "agent": me, "harness": args.harness,
+                "project": new_lease.get("project", ""), "event": "claim_denied",
+                "summary": (
+                    f"denied claim on {resource_id} — held by {existing.get('agent')} "
+                    f"until {existing.get('expires_at')}"
+                ),
+            })
+            return 1
+        # Stale lease — reclaim it.
+        write_yaml(lease_file, new_lease)
+        append_ledger({
+            "ts": iso_now(), "agent": me, "harness": args.harness,
+            "project": new_lease.get("project", ""), "event": "claim_stolen",
+            "summary": f"reclaimed stale lease on {resource_id} from {(existing or {}).get('agent', 'unknown')}",
+        })
+        print(f"GREEN — reclaimed stale lease (was {(existing or {}).get('agent', '?')}): {resource_id}")
+        return 0
+    write_yaml(lease_file, new_lease)
+    append_ledger({
+        "ts": iso_now(), "agent": me, "harness": args.harness,
+        "project": new_lease.get("project", ""), "event": "claim_acquired",
+        "summary": f"acquired {kind} lease on {resource_id}: {new_lease['intent'] or '(no intent stated)'}",
+    })
+    print(f"GREEN — lease acquired ({kind}): {resource_id}")
+    print(f"   ttl {new_lease['ttl_seconds']}s · expires {new_lease['expires_at']} · heartbeat to extend")
+    return 0
+
+
+def claim_heartbeat(args: argparse.Namespace) -> int:
+    resource_id, _kind = resolve_resource(args.resource)
+    lease_file = claim_path(resource_id)
+    lease = load_yaml(lease_file)
+    me = normalize_agent(args.agent)
+    if not lease:
+        print(f"no lease on {resource_id} — run `claim acquire` first")
+        return 1
+    if normalize_agent(lease.get("agent", "")) != me:
+        print(f"RED — lease on {resource_id} is held by {lease.get('agent')}, not you")
+        return 1
+    _bump_lease(lease)
+    write_yaml(lease_file, lease)
+    print(f"heartbeat ok — {resource_id} held until {lease['expires_at']}")
+    return 0
+
+
+def claim_release(args: argparse.Namespace) -> int:
+    resource_id, _kind = resolve_resource(args.resource)
+    lease_file = claim_path(resource_id)
+    lease = load_yaml(lease_file)
+    me = normalize_agent(args.agent)
+    if not lease:
+        print(f"no lease on {resource_id} — nothing to release")
+        return 0
+    holder = normalize_agent(lease.get("agent", ""))
+    if holder != me and not getattr(args, "force", False):
+        print(f"RED — lease on {resource_id} is held by {holder}, not you. Use --force to override.")
+        return 1
+    lease_file.unlink(missing_ok=True)
+    append_ledger({
+        "ts": iso_now(), "agent": me, "harness": args.harness,
+        "project": lease.get("project", ""), "event": "claim_released",
+        "summary": f"released lease on {resource_id}" + (f" (forced, was {holder})" if holder != me else ""),
+    })
+    print(f"released lease on {resource_id}")
+    return 0
+
+
+def claim_check(args: argparse.Namespace) -> int:
+    resource_id, _kind = resolve_resource(args.resource)
+    lease = load_yaml(claim_path(resource_id))
+    me = normalize_agent(getattr(args, "agent", "") or "")
+    if not lease:
+        print(f"GREEN — {resource_id} is unclaimed")
+        return 0
+    holder = normalize_agent(lease.get("agent", ""))
+    if not claim_is_live(lease):
+        print(f"GREEN — {resource_id}: lease by {holder} is STALE (expired {lease.get('expires_at')}); reclaimable")
+        return 0
+    if me and holder == me:
+        print(f"YELLOW — {resource_id}: lease is yours, expires {lease.get('expires_at')}")
+        return 0
+    print(
+        f"RED — {resource_id}: held by {holder} ({lease.get('harness')}), "
+        f"intent: {lease.get('intent') or '(none)'}, expires {lease.get('expires_at')}"
+    )
+    return 1
+
+
+def claim_board(_args: argparse.Namespace) -> int:
+    CLAIMS_DIR.mkdir(parents=True, exist_ok=True)
+    sweep_claims()
+    leases = all_claims()
+    print("=== Council Traffic Board ===")
+    print(f"checked_at: {iso_now()}")
+    if not leases:
+        print("\nall lanes clear — no active resource claims")
+    else:
+        print(f"\nActive leases ({len(leases)}):")
+        for lease in sorted(leases, key=lambda d: str(d.get("resource"))):
+            mark = "LIVE " if claim_is_live(lease) else "stale"
+            print(
+                f"  [{mark}] {lease.get('resource')}\n"
+                f"          {lease.get('agent')} ({lease.get('harness')}) · "
+                f"project={lease.get('project') or '?'} · intent: {lease.get('intent') or '(none)'}\n"
+                f"          acquired {lease.get('acquired_at')} · expires {lease.get('expires_at')}"
+            )
+    live = [d for d in leases if claim_is_live(d)]
+    collisions: list[str] = []
+    for i, a in enumerate(live):
+        for b in live[i + 1:]:
+            ra, rb = str(a.get("resource")), str(b.get("resource"))
+            if a.get("agent") == b.get("agent"):
+                continue
+            if ra == rb or ra.startswith(rb + "/") or rb.startswith(ra + "/"):
+                collisions.append(
+                    f"  COLLISION: {a.get('agent')} and {b.get('agent')} hold overlapping paths\n"
+                    f"      {ra}\n      {rb}"
+                )
+    if collisions:
+        print("\nCOLLISIONS:")
+        for line in collisions:
+            print(line)
+    # Open sessions in the ledger with no live claim on their cwd/repo.
+    claimed = {(normalize_agent(d.get("agent", "")), str(d.get("resource"))) for d in live}
+    unclaimed: list[str] = []
+    for event in open_sessions(ledger_events()).values():
+        agent = normalize_agent(str(event.get("agent", "")))
+        cwd = expand_path(event.get("cwd") or event.get("repo"), REPO_ROOT)
+        if not cwd:
+            continue
+        if not any(
+            ag == agent and (str(cwd) == res or str(cwd).startswith(res + "/") or res.startswith(str(cwd) + "/"))
+            for ag, res in claimed
+        ):
+            unclaimed.append(f"  {agent} has an open session at {cwd} with NO active claim")
+    if unclaimed:
+        print("\nOPEN SESSIONS WITHOUT A CLAIM:")
+        for line in unclaimed:
+            print(line)
+    if not collisions and not unclaimed:
+        print("\nNo collisions or unclaimed sessions detected.")
+    return 2 if collisions else 0
+
+
+def claim(args: argparse.Namespace) -> int:
+    dispatch = {
+        "acquire": claim_acquire,
+        "heartbeat": claim_heartbeat,
+        "release": claim_release,
+        "check": claim_check,
+        "board": claim_board,
+        "sweep": lambda _a: (print(f"swept {len(sweep_claims())} stale lease(s)") or 0),
+    }
+    return dispatch[args.claim_action](args)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Portable Agent Council")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -639,7 +966,22 @@ def main() -> int:
     session_parser.add_argument("--prs", default="")
     session_parser.add_argument("--blockers", default="")
     session_parser.add_argument("--next", default="")
+    claim_parser = sub.add_parser("claim", help="acquire/release/check resource leases (traffic control)")
+    claim_parser.add_argument("claim_action", choices=["acquire", "release", "heartbeat", "check", "board", "sweep"])
+    claim_parser.add_argument("--agent", default="")
+    claim_parser.add_argument("--harness", default="")
+    claim_parser.add_argument("--resource", default="")
+    claim_parser.add_argument("--intent", default="")
+    claim_parser.add_argument("--project")
+    claim_parser.add_argument("--ttl", type=int)
+    claim_parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    if args.command == "claim":
+        if args.claim_action in {"acquire", "heartbeat", "release"} and not args.agent:
+            raise SystemExit(f"claim {args.claim_action} requires --agent")
+        if args.claim_action in {"acquire", "heartbeat", "release", "check"} and not args.resource:
+            raise SystemExit(f"claim {args.claim_action} requires --resource")
+        return claim(args)
     if args.command == "doctor":
         return doctor(args.project)
     if args.command == "current":

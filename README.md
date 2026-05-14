@@ -7,9 +7,10 @@ It gives every agent a shared ritual:
 
 1. See what other agents are doing.
 2. Log session start.
-3. Work normally.
-4. Log session end with files, issues, PRs, blockers, and next action.
-5. Let a doctor command flag stale state, skipped closeouts, and drift.
+3. Claim the worktree you are about to edit (a red/yellow/green traffic light).
+4. Work normally; heartbeat the claim while you work.
+5. Log session end and release the claim.
+6. Let a doctor command flag stale state, skipped closeouts, drift, and lease collisions.
 
 This starter is deliberately local-first. It uses plain YAML and JSONL files,
 so it works with any agent that can read files and run shell commands.
@@ -23,7 +24,11 @@ is a lightweight coordination substrate:
 - `projects/*.yaml` are human-readable project cards.
 - `agents/*.yaml` are agent identity cards.
 - `current-state/*.yaml` is generated from the ledger, project cards, and git.
-- `doctor` reports stale sessions, missing references, and branch/head drift.
+- `claims/*.yaml` are short-lived resource leases — the traffic-control layer
+  that stops two agents editing the same worktree at once. Auto-expire 30 min
+  after the last heartbeat, so a crashed agent never blocks a lane forever.
+- `doctor` reports stale sessions, missing references, branch/head drift, stale
+  leases, and lease collisions.
 - `session_id` plus `parent_session_id` tracks root agents and sub-agents to
   any depth.
 - `steward` optionally runs a local read-mostly summary loop with deterministic
@@ -43,6 +48,12 @@ cd agent-council-starter
   --project example-app \
   --summary "Implement the next small feature"
 
+# Claim the worktree before writing in it. GREEN = go, RED = another agent
+# holds it (use your own `git worktree` instead). Heartbeat while you work.
+./bin/traffic.sh acquire \
+  --agent codex --harness openai-desktop \
+  --resource "$(pwd)" --intent "Implement the next small feature"
+
 ./bin/session.sh end \
   --agent codex \
   --harness openai-desktop \
@@ -53,7 +64,29 @@ cd agent-council-starter
   --prs "" \
   --blockers "" \
   --next "Open a PR after one more review pass"
+
+./bin/traffic.sh release --agent codex --resource "$(pwd)"
 ```
+
+## Traffic Control
+
+`session` records *that* an agent is working; it does not stop two agents from
+editing the same working directory. Claims do.
+
+```bash
+./bin/traffic.sh acquire --agent codex --harness openai-desktop \
+  --resource "$(pwd)" --intent "what you will change here"
+./bin/traffic.sh heartbeat --agent codex --resource "$(pwd)"   # extend while working
+./bin/traffic.sh check --agent codex --resource "$(pwd)"        # GREEN/YELLOW/RED, no mutation
+./bin/traffic.sh board                                         # all leases + collisions
+./bin/traffic.sh release --agent codex --resource "$(pwd)"
+```
+
+A claim is a lease on a resource — almost always a worktree path. It is atomic
+(`O_EXCL` create), auto-expires 30 minutes after the last heartbeat, and is
+keyed to the worktree path: two agents in the same repo via separate
+`git worktree` directories never collide. `board` and `doctor` flag overlapping
+live leases.
 
 ## Sub-Agent Trees
 
@@ -110,6 +143,7 @@ agent-council-starter/
 ├── bin/
 │   ├── council.py
 │   ├── session.sh
+│   ├── traffic.sh
 │   ├── doctor.sh
 │   ├── current-state.sh
 │   ├── query.sh
@@ -120,6 +154,7 @@ agent-council-starter/
 │   ├── ledger.example.jsonl
 │   ├── agents/
 │   ├── projects/
+│   ├── claims/
 │   └── current-state/
 ├── docs/
 │   ├── AGENT_INSTRUCTIONS_SNIPPET.md

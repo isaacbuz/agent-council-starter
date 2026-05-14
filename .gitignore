@@ -10,3 +10,5 @@ node_modules/
 .council/steward/reports/*.md
 .council/steward/reports/*.json
 !.council/steward/reports/.gitkeep
+.council/claims/*.yaml
+!.council/claims/.gitkeep

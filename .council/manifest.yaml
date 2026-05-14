@@ -23,4 +23,6 @@ ledger: ledger.jsonl
 query_tool: query.sh
 doctor_tool: doctor.sh
 session_tool: session.sh
+traffic_tool: traffic.sh        # red/yellow/green resource leases — claim a worktree BEFORE writing in it
+claims_dir: claims/             # one lease file per claimed resource; auto-expires 30 min after last heartbeat
 current_state_dir: current-state/
